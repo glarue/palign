@@ -1,0 +1,570 @@
+#!/usr/bin/env python3
+
+"""
+usage: palign [-h] [-p PARALLEL_PROCESSES] [-s] [-f OUTPUT_FORMAT]
+              [-o OUTPUT_NAME] [-t THREADS] [-e E_VALUE] [-naf] [--clobber_db]
+              query subject
+              {diamondp,diamondx,blastn,blastp,blastx,tblastn,tblastx}
+
+Align one file against another. Any arguments not listed here will be passed
+to the chosen aligner unmodified.
+
+positional arguments:
+  query                 query file to be aligned
+  subject               subject file to be aligned against
+  {diamondp,diamondx,blastn,blastp,blastx,tblastn,tblastx}
+                        type of alignment to run
+
+optional arguments:
+  -h, --help            show this help message and exit
+  -p PARALLEL_PROCESSES, --parallel_processes PARALLEL_PROCESSES
+                        run the alignment step using multiple parallel
+                        processes; if unspecified, will use half of available
+                        system CPUs (default: None)
+  -s, --single          disable parallel processing (default: False)
+  -f OUTPUT_FORMAT, --output_format OUTPUT_FORMAT
+                        integer output format for alignment results (default:
+                        6)
+  -o OUTPUT_NAME, --output_name OUTPUT_NAME
+                        filename for results (otherwise, automatic based on
+                        input) (default: None)
+  -t THREADS, --threads THREADS
+                        number of threads per process. Be careful when
+                        combining this with multiple processes! (default: 1)
+  -e E_VALUE, --e_value E_VALUE
+                        e-value threshold to use for search (default: 1e-10)
+  -naf, --no_auto_format
+                        disable helper operations that auto-format
+                        subject/query as needed and build database if not
+                        already present (default: False)
+  --clobber_db          create new database even if one already exists
+                        (default: False)
+"""
+
+import sys
+import subprocess
+import os
+import time
+import argparse
+from multiprocessing import Pool, cpu_count
+from itertools import chain
+from functools import partial
+from math import ceil, log
+from biogl import fasta_parse, get_runtime, translate
+
+
+def abbreviate(name, delimiter="."):
+    name = os.path.basename(name)  # in case of non-local file path
+    abbreviation = name.split(delimiter)[0]
+
+    return abbreviation
+
+
+def unique_filenames(*file_list):
+    abbreviated = [abbreviate(f) for f in file_list]
+    if len(set(abbreviated)) < len(abbreviated):  # not all are unique
+        return [os.path.basename(f) for f in file_list]
+    else:
+        return abbreviated
+
+
+def db_check(db_filename, db_endings):
+    end_length = len(max(db_endings, key=len))
+    db_directory = os.path.dirname(os.path.abspath(db_filename))
+    db_name = os.path.basename(db_filename)
+    db_dir_files = os.listdir(db_directory)
+    db_dir_files = [f for f in db_dir_files if f.startswith(db_name)]
+    # db_endings = ('sq', 'in', 'hr')
+    # get just the file endings
+    db_files = [f.split('.')[-1] for f in db_dir_files]
+    present_endings = set([f[-end_length:] for f in db_files])
+    if all(dbe in present_endings for dbe in db_endings):
+        previous_db = True
+    else:
+        previous_db = False
+    
+    return previous_db
+
+
+def make_db(fasta, aligner, db_type="nucleotide"):
+    """
+    Creates a local BLAST/DIAMOND database using a
+    FASTA file. $db_type may be either "protein"
+    or "nucleotide".
+
+    """
+    print(
+        "[#] Creating local {} database".format(aligner.upper()), 
+        file=sys.stderr
+    )
+    type_map = {
+        'protein': 'prot',
+        'nucleotide': 'nucl'
+    }
+    cmd_map = {
+        'diamond': [
+            'diamond',
+            'makedb',
+            '--in',
+            fasta,
+            '--db',
+            fasta],
+        'blast': [
+            'makeblastdb',
+            '-in',
+            fasta,
+            '-dbtype',
+            type_map[db_type]]
+    }
+    cmd_args = cmd_map[aligner]
+    subprocess.call(cmd_args)
+    print("\n[#] {} database created for '{}'"
+          .format(aligner, fasta), file=sys.stderr)
+
+
+def is_fasta(some_file):
+    with open(some_file) as f:
+        for l in f:
+            if l.startswith("#"):
+                continue
+            if l.startswith(">"):
+                return True
+            else:
+                return False
+
+
+def seq_type(fasta):
+    # just get first sequence
+    _, s = next(fasta_parse(fasta))
+    if any(c not in 'ATCGN' for c in s):
+        return 'protein'
+    else:
+        return 'nucleotide'
+
+
+def make_fasta(some_file):
+    fasta_name = os.path.basename(some_file) + ".fasta"
+    if not os.path.isfile(fasta_name):
+        with open(some_file) as infile, open(fasta_name, 'w') as outfile:
+            for i, l in enumerate(infile, start=1):
+                outfile.write('>{}\n{}\n'.format(i, l.strip()))
+    return fasta_name
+
+
+def make_pro(fasta, ftype=''):
+    fasta_name = os.path.basename(fasta)
+    out_name = "{}.pro".format(fasta_name)
+    if ftype:
+        ftype = ' for {}'.format(ftype)
+    if os.path.isfile(out_name):
+        print('[#] Using exising file \'{}\'{}'
+              .format(out_name, ftype), file=sys.stderr)
+    else:
+        print("[#] Starting translation of '{}'{}"
+              .format(fasta, ftype), file=sys.stderr)
+        outfile = open(out_name, 'w')
+        for h, s in fasta_parse(fasta, trim_header=False):
+            aa = translate(s)
+            outfile.write('>{}\n{}\n'.format(h, aa))
+        print("[#] Translation finished", file=sys.stderr)
+    return out_name
+
+
+def prep_run(
+    query, subject, aligner, run_type, no_format=False, overwrite=True):
+    pair_combos = {
+        'pro-pro': {
+            'query': 'protein',
+            'subject': 'protein'},
+        'nuc-nuc': {
+            'query': 'nucleotide',
+            'subject': 'nucleotide'},
+        'pro-nuc': {
+            'query': 'protein',
+            'subject': 'nucleotide'},
+        'nuc-pro': {
+            'query': 'nucleotide',
+            'subject': 'protein'}
+    }
+    db_type_map = {
+        'blastn': 'nuc-nuc',
+        'blastp': 'pro-pro',
+        'blastx': 'nuc-pro',
+        'tblastn': 'pro-nuc',
+        'tblastx': 'nuc-nuc'
+    }
+    db_endings_map = {
+        'blast': ['sq', 'in', 'hr'],
+        'diamond': ['dmnd']
+    }
+
+    run_files = {'query': query, 'subject': subject}
+
+    # determine what format the files should be (pro or nucl)
+    # based upon the BLAST type
+    target_format = {}
+    for ftype, fn in run_files.items():
+        db_type = db_type_map[run_type]
+        target_format[ftype] = pair_combos[db_type][ftype]
+
+    # convert the appropriate files to protein if needed
+    if not no_format:
+        for ftype, fn in run_files.items():
+            fmt = target_format[ftype]
+            if fmt == 'protein' and seq_type(fn) != 'protein':
+                fn = make_pro(fn, ftype)
+                # add new fn to dict
+                target_format[ftype] = fmt
+                run_files[ftype] = fn
+    
+    subject = run_files['subject']
+    query = run_files['query']
+
+    # check for already-created database
+    db_ends = db_endings_map[aligner]
+    if db_check(subject, db_ends):
+        if overwrite:
+            print('[#] Replacing existing {} database for \'{}\''
+                  .format(aligner.upper(), subject))
+            make_db(subject, aligner, db_type=target_format['subject'])
+        else:
+            print('[#] Using existing {} database for \'{}\''
+            .format(aligner.upper(), subject), file=sys.stderr)
+    elif not no_format:
+        make_db(subject, aligner, db_type=target_format['subject'])
+
+    return query, subject
+
+
+def local_alignment(
+        aligner,
+        db_file,
+        run_type,
+        query_file,  # this order is important for partial()
+        filename,  # this order is important for partial()
+        out_fmt=6, 
+        threads=1, 
+        e_value=1e-10,
+        extra_args=None):
+    """
+    Runs alignment sub-program (blastp, blastn, blastx, tblastn, tblastx)
+    with the given query on the given database.
+
+    Optional: out_fmt = type as per BLAST+ documentation; threads = number
+    of threads to use for job; e = e-value cutoff for hits
+
+    extra_args is a list of additional arguments to pass to the aligner
+
+    """
+    if extra_args is None:
+        extra_args = []  # make unpacking syntax work
+    start_time = time.time()
+    db_abbrev = abbreviate(db_file)
+    query_abbrev = abbreviate(query_file)
+    output_suffix = '.'.join([aligner, run_type])
+    if filename is None:
+        filename = "{}-vs-{}.{}".format(
+            query_abbrev, db_abbrev, output_suffix)
+    cmd_kwargs = {
+        'blast': {
+            '-db': db_file,
+            '-query': query_file,
+            '-evalue': e_value,
+            '-num_threads': threads,
+            '-outfmt': out_fmt,
+            '-out': filename},
+        'diamond': {
+            '--db': db_file,
+            '--query': query_file,
+            '--evalue': e_value,
+            '--threads': threads,
+            '--outfmt': out_fmt,
+            '--out': filename}
+    }
+    # avoid redundant arguments being passed to BLAST
+    cmd_kwargs = {
+        k: v for k, v in cmd_kwargs[aligner].items() if k not in extra_args
+    }
+    # flatten to list of args
+    if aligner == 'diamond':
+        cmd_args = [aligner, run_type]
+    else:
+        cmd_args = [run_type]
+    cmd_args.extend(
+        list(chain.from_iterable(cmd_kwargs.items())) + extra_args)
+    cmd_args = [str(c) for c in cmd_args]
+    cmd_string = ' '.join(cmd_args)
+    vs = "'{}' vs. '{}'".format(query_file, db_file)
+    print("[#] Starting {} run {}:\n{}"
+          .format(aligner.upper(), vs, cmd_string), file=sys.stderr)
+    subprocess.call(cmd_args)
+    run_time = get_runtime(start_time)
+    print(
+        "[#] {}: {} finished in {}".format(aligner.upper(), vs, run_time), 
+        file=sys.stderr
+    )
+
+    return filename
+
+
+def parallel_alignment(
+        aligner,
+        query,
+        subject, 
+        run_type,
+        out_fmt=6,
+        e_value=1e-10,
+        threads=1,
+        out_name=None,
+        extra_args=None):
+    pool = Pool(PARALLEL)
+    align = partial(
+        local_alignment,
+        aligner,
+        subject, 
+        run_type,
+        threads=threads,
+        out_fmt=out_fmt,
+        e_value=e_value, 
+        extra_args=extra_args)
+    count = sum([1 for p in fasta_parse(query)])
+    block_size = ceil(count / PARALLEL)
+    # change padding depth according to total number of chunks
+    zero_pad = ceil(log(PARALLEL + 1, 10))
+    chunk_name_scheme = '{0}.{1:0{2}}.chunk'
+    chunk_name = chunk_name_scheme.format(query, 1, zero_pad)
+    chunk = open(chunk_name, 'w')
+    chunked = [chunk_name]
+    tally = 1
+    output_suffix = '.'.join([aligner, run_type])
+    for index, (h, s) in enumerate(fasta_parse(query), start=1):   
+        if index > block_size and index % block_size == 1:
+            tally += 1
+            # order matters here
+            chunk.close()
+            chunk_name = chunk_name_scheme.format(query, tally, zero_pad)
+            chunked.append(chunk_name)
+            chunk = open(chunk_name, 'w')
+            chunk.write('>{}\n{}\n'.format(h, s))                        
+        else:
+            chunk.write('>{}\n{}\n'.format(h, s))
+    chunk.close()
+    chunk_list = '\n'.join(chunked)    
+    print('[#] Query split into {} files:\n{}\n'
+          .format(len(chunked), chunk_list))
+    if out_name is None:
+        out_name = '{}-vs-{}.{}'.format(
+            abbreviate(query), abbreviate(subject), output_suffix)
+    filenames = [
+        '{0}.{1:0{2}}.tmp'.format(out_name, i, zero_pad) 
+        for i in range(1, len(chunked) + 1)
+        ]
+    # use apply_async instead of starmap to allow messages
+    # to print to screen without clobbering each other
+    results = []
+    for pair in zip(chunked, filenames):
+        results.append(pool.apply_async(align, args=pair))
+        time.sleep(.05)
+    pool.close()
+    pool.join()
+    results = [r.get() for r in results]
+
+    # clean up chunk files
+    [os.remove(f) for f in chunked]
+
+    return results
+
+
+def concatenate(outname, file_list, clean=True):
+    with open(outname, 'w') as outfile:
+        for fn in file_list:
+            with open(fn) as f:
+                for l in f:
+                    outfile.write(l)
+    if clean:
+        [os.remove(fn) for fn in file_list]
+
+
+def parse_run_type(align_type_arg):
+    type_map = {
+        'diamondp': ('diamond', 'blastp'),
+        'diamondx': ('diamond', 'blastx'),
+        'blastn': ('blast', 'blastn'),
+        'blastp': ('blast', 'blastp'),
+        'blastx': ('blast', 'blastx'),
+        'tblastn': ('blast', 'tblastn'),
+        'tblastx': ('blast', 'tblastx'),
+    }
+
+    return type_map[align_type_arg]
+
+
+parser = argparse.ArgumentParser(
+    description=(
+        'Align one file against another. '
+        'Any arguments not listed here will '
+        'be passed to the chosen aligner unmodified.'),
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter, 
+    allow_abbrev=False)
+
+parser.add_argument(
+    'query',
+    help='query file to be aligned'
+)
+parser.add_argument(
+    'subject',
+    help='subject file to be aligned against'
+)
+parser.add_argument(
+    'align_type',
+    choices=[
+        'diamondp',
+        'diamondx',
+        'blastn',
+        'blastp',
+        'blastx',
+        'tblastn',
+        'tblastx'],
+    help='type of alignment to run'
+)
+parser.add_argument(
+    '-p',
+    '--parallel_processes',
+    help=(
+        'run the alignment step using multiple parallel processes; '
+        'if unspecified, will use half of available system CPUs'),
+    type=int
+)
+parser.add_argument(
+    '-s',
+    '--single',
+    help='disable parallel processing',
+    action='store_true'
+)
+parser.add_argument(
+    '-f',
+    '--output_format',
+    type=int,
+    help='integer output format for alignment results',
+    default=6
+)
+parser.add_argument(
+    '-o',
+    '--output_name',
+    type=str,
+    help='filename for results (otherwise, automatic based on input)'
+)
+parser.add_argument(
+    '-t',
+    '--threads',
+    type=int,
+    default=1,
+    help=(
+        'number of threads per process. Be careful when combining this '
+        'with multiple processes!')
+)
+parser.add_argument(
+    '-e',
+    '--e_value',
+    help='e-value threshold to use for search',
+    type=float,
+    default=1e-10
+)
+parser.add_argument(
+    '-naf',
+    '--no_auto_format',
+    help='disable helper operations that auto-format subject/query as needed '
+    'and build database if not already present',
+    action='store_true'
+)
+parser.add_argument(
+    '--clobber_db',
+    help='create new database even if one already exists',
+    action='store_true'
+)
+
+if len(sys.argv) == 1:
+    sys.exit(parser.print_help())
+
+main_start_time = time.time()
+
+args, EXTRA_ARGS = parser.parse_known_args()
+
+ALIGN_TYPE = args.align_type
+PARALLEL = args.parallel_processes
+SINGLE = args.single
+OUT_NAME = args.output_name
+THREADS = args.threads
+E_VALUE = args.e_value
+OUT_FORMAT = args.output_format
+NO_AUTO = args.no_auto_format
+OVERWRITE = args.clobber_db
+
+# assume if THREADS is specified alone, the user wants
+# to replace parallelism with threading rather than 
+# blowing up the CPU count to (cores/2) * THREADS
+if not PARALLEL and THREADS:
+    SINGLE = True
+elif not PARALLEL and not THREADS:
+    PARALLEL = round(cpu_count() / 2)
+
+run_files = {'query': args.query, 'subject': args.subject}
+
+if not NO_AUTO:
+    for ftype, fn in run_files.items():
+        if not is_fasta(fn):
+            run_files[ftype] = make_fasta(fn)
+
+SUBJECT = run_files['subject']
+QUERY = run_files['query']
+
+ALIGNER, RUN_TYPE = parse_run_type(ALIGN_TYPE)
+
+if ALIGNER == 'diamond':
+    EXTRA_ARGS.extend(
+        ['--quiet', '--more-sensitive', '--max-target-seqs', '500'])
+
+if not OUT_NAME:
+    subj, quer = unique_filenames(SUBJECT, QUERY)
+    out_suffix = '.'.join([ALIGNER, RUN_TYPE])
+    OUT_NAME = '{}-vs-{}.{}'.format(
+        quer, 
+        subj,
+        out_suffix)
+
+QUERY, SUBJECT = prep_run(
+    QUERY, SUBJECT, ALIGNER, RUN_TYPE, no_format=NO_AUTO, overwrite=OVERWRITE)
+
+current_runtime = get_runtime(main_start_time)
+print('[#] Database prep finished in {}'.format(current_runtime))
+
+if not SINGLE and PARALLEL > 1: #PARALLEL:
+    # run multiple processes, and then join the output afterward
+    pblast_out = parallel_alignment(
+        ALIGNER,
+        QUERY,
+        SUBJECT, 
+        RUN_TYPE,
+        threads=THREADS,
+        out_fmt=OUT_FORMAT,
+        e_value=E_VALUE, 
+        out_name=OUT_NAME,
+        extra_args=EXTRA_ARGS)
+    concatenate(OUT_NAME, pblast_out)
+else:
+    blast_out = local_alignment(
+        ALIGNER,
+        SUBJECT, 
+        RUN_TYPE,
+        QUERY, 
+        OUT_NAME,
+        threads=THREADS,
+        out_fmt=OUT_FORMAT,
+        e_value=E_VALUE,
+        extra_args=EXTRA_ARGS)
+
+current_runtime = get_runtime(main_start_time)
+print( '[#] {} run finished in {}'.format(ALIGNER.upper(), current_runtime))
+print('[#] Results written to \'{}\''.format(OUT_NAME))
+
+sys.exit(0)
