@@ -124,7 +124,11 @@ def make_db(fasta, aligner, db_type="nucleotide"):
             type_map[db_type]]
     }
     cmd_args = cmd_map[aligner]
-    subprocess.call(cmd_args)
+    makedb_result = subprocess.run(
+        cmd_args, stdout=subprocess.PIPE, universal_newlines=True
+    )
+    # redirect makedb stdout to stderr to avoid polluting output file
+    print(makedb_result.stdout, file=sys.stderr)
     print("\n[#] {} database created for '{}'"
           .format(aligner.upper(), fasta), file=sys.stderr)
 
