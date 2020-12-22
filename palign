@@ -494,6 +494,17 @@ parser.add_argument(
     help='create new database even if one already exists',
     action='store_true'
 )
+parser.add_argument(
+    '--diamond_sensitivity',
+    help='sensitivity setting for DIAMOND',
+    choices=(
+        'sensitive', 
+        'more-sensitive', 
+        'very-sensitive', 
+        'ultra-sensitive'
+    ),
+    default='very-sensitive'
+)
 
 if len(sys.argv) == 1:
     sys.exit(parser.print_help())
@@ -537,8 +548,9 @@ QUERY = run_files['query']
 ALIGNER, RUN_TYPE = parse_run_type(ALIGN_TYPE)
 
 if ALIGNER == 'diamond':
+    sensitivity = '--{}'.format(args.diamond_sensitivity)
     EXTRA_ARGS.extend(
-        ['--quiet', '--more-sensitive', '--max-target-seqs', '500'])
+        ['--quiet', sensitivity, '--max-target-seqs', '500'])
 
 if not OUT_NAME:
     subj, quer = unique_filenames(SUBJECT, QUERY)
