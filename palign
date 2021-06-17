@@ -90,6 +90,7 @@ import subprocess
 import os
 import time
 import argparse
+from hashlib import md5
 from multiprocessing import Pool, cpu_count
 from itertools import chain
 from functools import partial
@@ -97,9 +98,25 @@ from math import ceil, log
 from biogl import fasta_parse, get_runtime, translate, is_fasta
 
 
-def abbreviate(name, delimiter="."):
-    name = os.path.basename(name)  # in case of non-local file path
-    abbreviation = name.split(delimiter)[0]
+def file_md5(fn, buffer_size=65536):
+    hash = md5()
+
+    with open(fn, 'rb') as f:
+        while True:
+            data = f.read(buffer_size)
+            if not data:
+                break
+            hash.update(data)
+
+    return hash.hexdigest()
+
+
+def abbreviate(name, delimiter=".", use_hash=True):
+    local_name = os.path.basename(name)  # in case of non-local file path
+    abbreviation = local_name.split(delimiter)[0]
+    if use_hash is True:  # use shortened md5 hash to uniqueify name
+        hash = file_md5(name)[:7]
+        abbreviation = abbreviation + delimiter + hash
 
     return abbreviation
 
@@ -275,15 +292,15 @@ def prep_run(
 
 
 def local_alignment(
-        aligner,
-        db_file,
-        run_type,
-        query_file,  # this order is important for partial()
-        filename,  # this order is important for partial()
-        out_fmt=6, 
-        threads=1, 
-        e_value=1e-10,
-        extra_args=None):
+    aligner,
+    db_file,
+    run_type,
+    query_file,  # this order is important for partial()
+    filename,  # this order is important for partial()
+    out_fmt=6, 
+    threads=1, 
+    e_value=1e-10,
+    extra_args=None):
     """
     Runs alignment sub-program (blastp, blastn, blastx, tblastn, tblastx)
     with the given query on the given database.
