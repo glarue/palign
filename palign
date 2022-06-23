@@ -288,6 +288,8 @@ def local_alignment(
     if filename is None:
         filename = "{}-vs-{}.{}".format(
             query_abbrev, db_abbrev, output_suffix)
+    if aligner == 'diamond' and not db_file.endswith('.dmnd'):
+        db_file += '.dmnd'  # avoid ambiguity with BLAST db files in same dir
     cmd_kwargs = {
         'blast': {
             '-db': db_file,
